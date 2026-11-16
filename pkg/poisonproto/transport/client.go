@@ -25,27 +25,64 @@ type ClientConfig struct {
 	DeviceSeed      []byte
 	Fingerprint     fingerprint.YandexAndroidParams
 	DialTimeout     time.Duration
+	// Session configures the L3 pool/budget/ACK-timeout policy (ТЗ §8,
+	// subscription config §14 "session" section). The zero value means
+	// session.DefaultConfig().
+	Session session.Config
 }
 
-// Dial opens one PoisonProto connection end to end: TCP, the
-// yandex-android-masked TLS handshake with the ТЗ §6.1 token embedded in
-// session_id, the L2 Noise IK handshake, and the L3 SESSION_ATTACH.
+func (c ClientConfig) sessionConfig() session.Config {
+	if c.Session.PoolMin == 0 {
+		return session.DefaultConfig()
+	}
+	return c.Session
+}
+
+// Dial opens a PoisonProto session: the first connection end to end (TCP,
+// the yandex-android-masked TLS handshake with the ТЗ §6.1 token embedded
+// in session_id, the L2 Noise IK handshake, and the L3 SESSION_ATTACH),
+// then lets the session itself grow and maintain its connection pool (ТЗ
+// §8.1) by calling back into dialRawConn for every additional connection
+// it needs, including after migration (ТЗ §8.4).
 func Dial(cfg ClientConfig) (*session.Session, error) {
+	firstConn, err := dialRawConn(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	id, err := session.NewID()
+	if err != nil {
+		return nil, err
+	}
+
+	dialer := func() (*crypto.Conn, error) { return dialRawConn(cfg) }
+	sess, err := session.New(id, firstConn, true, cfg.sessionConfig(), dialer)
+	if err != nil {
+		firstConn.Close()
+		return nil, fmt.Errorf("transport: L3 attach: %w", err)
+	}
+	return sess, nil
+}
+
+// dialRawConn establishes one fully-masked, fully-authenticated L0-L2
+// connection to cfg.Addr — everything up to (not including) the L3
+// SESSION_ATTACH, so it can be reused both for a session's first
+// connection and for every connection session.Dialer opens afterward.
+func dialRawConn(cfg ClientConfig) (*crypto.Conn, error) {
 	d := net.Dialer{Timeout: cfg.DialTimeout}
 	raw, err := d.Dial("tcp", cfg.Addr)
 	if err != nil {
 		return nil, fmt.Errorf("transport: dial: %w", err)
 	}
-
-	sess, err := handshake(raw, cfg)
+	c, err := handshake(raw, cfg)
 	if err != nil {
 		raw.Close()
 		return nil, err
 	}
-	return sess, nil
+	return c, nil
 }
 
-func handshake(raw net.Conn, cfg ClientConfig) (*session.Session, error) {
+func handshake(raw net.Conn, cfg ClientConfig) (*crypto.Conn, error) {
 	spec, err := fingerprint.BuildClientHelloSpec(cfg.DeviceSeed, time.Now(), cfg.Fingerprint, cfg.SNI)
 	if err != nil {
 		return nil, fmt.Errorf("transport: build ClientHello spec: %w", err)
@@ -103,13 +140,5 @@ func handshake(raw net.Conn, cfg ClientConfig) (*session.Session, error) {
 		return nil, fmt.Errorf("transport: L2 handshake: %w", err)
 	}
 
-	id, err := session.NewID()
-	if err != nil {
-		return nil, err
-	}
-	sess := session.New(id, crypto.NewConn(uconn, keys), true)
-	if err := sess.Attach(); err != nil {
-		return nil, fmt.Errorf("transport: L3 attach: %w", err)
-	}
-	return sess, nil
+	return crypto.NewConn(uconn, keys), nil
 }

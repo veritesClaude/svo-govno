@@ -19,6 +19,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/veritesclaude/svo-govno/pkg/poisonproto/auth"
@@ -66,26 +67,33 @@ func main() {
 	}
 	log.Printf("poisonproto-server listening on %s, fallback=%s", *listenAddr, *fallbackAddr)
 
+	srv := &transport.Server{Config: transport.ServerConfig{
+		Verifier:    verifier,
+		NoiseStatic: priv,
+		Cert:        cert,
+		FallbackDial: func(string) (net.Conn, error) {
+			return net.Dial("tcp", *fallbackAddr)
+		},
+		UserAllowed: allowed,
+	}}
+
+	// ТЗ §8.1: a session's connection pool means several accepted TCP
+	// connections join the *same* session; only the first one for a given
+	// session ID should start that session's stream-accept loop.
+	var startedSessions sync.Map // session.ID -> struct{}
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			log.Printf("accept: %v", err)
 			continue
 		}
-		go handleConn(conn, transport.ServerConfig{
-			Verifier:    verifier,
-			NoiseStatic: priv,
-			Cert:        cert,
-			FallbackDial: func(string) (net.Conn, error) {
-				return net.Dial("tcp", *fallbackAddr)
-			},
-			UserAllowed: allowed,
-		})
+		go handleConn(conn, srv, &startedSessions)
 	}
 }
 
-func handleConn(conn net.Conn, cfg transport.ServerConfig) {
-	sess, userID, err := transport.Accept(conn, cfg)
+func handleConn(conn net.Conn, srv *transport.Server, started *sync.Map) {
+	sess, userID, err := srv.HandleConn(conn)
 	if err != nil {
 		var fb *transport.ErrFallback
 		if errors.As(err, &fb) {
@@ -95,12 +103,18 @@ func handleConn(conn net.Conn, cfg transport.ServerConfig) {
 		}
 		return
 	}
+
+	if _, already := started.LoadOrStore(sess.ID(), struct{}{}); already {
+		log.Printf("%s: joined existing session for user %d", conn.RemoteAddr(), userID)
+		return
+	}
 	log.Printf("%s: session established for user %d", conn.RemoteAddr(), userID)
 
 	go func() {
 		if err := sess.Run(); err != nil {
-			log.Printf("%s: session ended: %v", conn.RemoteAddr(), err)
+			log.Printf("session %x ended: %v", sess.ID(), err)
 		}
+		started.Delete(sess.ID())
 	}()
 
 	for {

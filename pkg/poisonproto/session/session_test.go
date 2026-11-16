@@ -56,23 +56,42 @@ func newPairedSessions(t *testing.T) (client, server *Session) {
 		t.Fatal(err)
 	}
 
-	client = New(id, crypto.NewConn(c1, cr.keys), true)
-	server = New(ID{}, crypto.NewConn(c2, sr.keys), false)
-
-	attachErr := make(chan error, 2)
-	go func() { attachErr <- server.Attach() }()
-	go func() { attachErr <- client.Attach() }()
-	for i := 0; i < 2; i++ {
-		if err := <-attachErr; err != nil {
-			t.Fatalf("attach: %v", err)
-		}
+	cfg := Config{
+		PoolMin: 1, PoolMax: 1,
+		BudgetMin: 1 << 30, BudgetMax: 1<<30 + 1,
+		Adaptive:      false,
+		AckTimeoutMin: 300 * time.Millisecond,
+		AckTimeoutMax: 500 * time.Millisecond,
 	}
+
+	type newResult struct {
+		sess *Session
+		err  error
+	}
+	clientNew := make(chan newResult, 1)
+	serverNew := make(chan newResult, 1)
+	go func() {
+		s, err := New(id, crypto.NewConn(c1, cr.keys), true, cfg, nil)
+		clientNew <- newResult{s, err}
+	}()
+	go func() {
+		s, err := New(ID{}, crypto.NewConn(c2, sr.keys), false, cfg, nil)
+		serverNew <- newResult{s, err}
+	}()
+
+	cn := <-clientNew
+	if cn.err != nil {
+		t.Fatalf("client New: %v", cn.err)
+	}
+	sn := <-serverNew
+	if sn.err != nil {
+		t.Fatalf("server New: %v", sn.err)
+	}
+	client, server = cn.sess, sn.sess
+
 	if client.ID() != server.ID() {
 		t.Fatalf("session ID mismatch after attach: %x != %x", client.ID(), server.ID())
 	}
-
-	go client.Run()
-	go server.Run()
 
 	return client, server
 }

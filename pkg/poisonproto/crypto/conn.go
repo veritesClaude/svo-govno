@@ -64,7 +64,7 @@ const (
 // wire) — it only exposes ShouldRekeySend/RekeySend/RekeyRecv so session
 // can drive it.
 type Conn struct {
-	rw   io.ReadWriter
+	rw   io.ReadWriteCloser
 	keys *TransportKeys
 
 	sendBytes uint64
@@ -73,10 +73,15 @@ type Conn struct {
 	recvSince time.Time
 }
 
-func NewConn(rw io.ReadWriter, keys *TransportKeys) *Conn {
+func NewConn(rw io.ReadWriteCloser, keys *TransportKeys) *Conn {
 	now := time.Now()
 	return &Conn{rw: rw, keys: keys, sendSince: now, recvSince: now}
 }
+
+// Close closes the underlying L1 transport (e.g. the TLS connection,
+// triggering close_notify). Used by package session to retire one pool
+// connection (ТЗ §8.2) without ending the session.
+func (c *Conn) Close() error { return c.rw.Close() }
 
 // Seal encrypts one plaintext L3 frame and writes it as a length-prefixed
 // record. ad is additional authenticated data (empty is fine; session may

@@ -153,8 +153,14 @@ func TestKeyShareOrder(t *testing.T) {
 		if ks.KeyShares[2].Group != utls.X25519 {
 			t.Errorf("key_share[2] group = %v, want X25519", ks.KeyShares[2].Group)
 		}
-		if utls.CurveID(utls.GREASE_PLACEHOLDER) == ks.KeyShares[0].Group {
-			t.Errorf("key_share[0] GREASE was not substituted by ApplyPreset")
+		// RFC 8701 GREASE values are 0x?A?A with both bytes equal (0x0A0A,
+		// 0x1A1A, ... 0xFAFA); the placeholder (0x0A0A) is itself one of the
+		// 16 possible values, so checking "!= placeholder" is wrong — it
+		// would spuriously fail ~1/16 of the time when ApplyPreset's random
+		// substitution happens to land back on 0x0A0A.
+		g := uint16(ks.KeyShares[0].Group)
+		if hi, lo := g>>8, g&0xff; hi != lo || lo&0x0f != 0x0a {
+			t.Errorf("key_share[0] group %#04x is not a valid GREASE value", g)
 		}
 		return
 	}

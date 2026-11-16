@@ -1,43 +1,68 @@
-// Package session implements L3 (ТЗ раздел 8): frame sequencing and stream
-// multiplexing on top of the L2 crypto.Conn.
+// Package session implements L3/L4 (ТЗ раздел 8-9): a session spans a
+// pool of L0-L2 connections, numbers every frame, retransmits DATA frames
+// across the pool on ACK timeout, adapts each connection's byte budget,
+// and migrates by opening fresh connections when the pool dies — plus
+// stream multiplexing on top (package stream.go).
 //
-// Phase-1 scope only: ТЗ §17 п.1 calls for "простая сессия через одно
-// соединение" (a simple session over a single connection). The connection
-// pool, per-connection byte budget, ACK-timeout retransmission across the
-// pool, and migration (ТЗ §8.2–8.4) are phase 2 and deliberately not here —
-// see ROADMAP.md. What this package does implement for real: the session
-// handshake (SESSION_ATTACH), stream open/data/close multiplexing, PING
-// echo, and driving L2 REKEY at the agreed frame boundary.
+// Phase-3 scope (not here, see ROADMAP.md): per-stream flow-control
+// windows, UDP datagrams, traffic shaping/padding, and PSK-based faster
+// reattachment.
 package session
 
 import (
-	"crypto/rand"
 	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/veritesclaude/svo-govno/pkg/poisonproto/crypto"
 	"github.com/veritesclaude/svo-govno/pkg/poisonproto/frame"
 )
 
-// ID is a session identifier (ТЗ §8.1: "случайный ID 16 байт").
-type ID [16]byte
-
-func NewID() (ID, error) {
-	var id ID
-	_, err := rand.Read(id[:])
-	return id, err
+// Config holds the tunables ТЗ §14's subscription config exposes for L3
+// (section "session"): pool size, per-connection byte budget, whether the
+// budget adapts, and the ACK-timeout range.
+type Config struct {
+	PoolMin, PoolMax             int
+	BudgetMin, BudgetMax         int
+	Adaptive                     bool
+	AckTimeoutMin, AckTimeoutMax time.Duration
 }
 
-// Session multiplexes streams over one crypto.Conn (see package doc for
-// phase-1 scope).
+// DefaultConfig matches the ТЗ §14 example defaults.
+func DefaultConfig() Config {
+	return Config{
+		PoolMin: 4, PoolMax: 8,
+		BudgetMin: 9000, BudgetMax: 14000,
+		Adaptive:      true,
+		AckTimeoutMin: 300 * time.Millisecond,
+		AckTimeoutMax: 500 * time.Millisecond,
+	}
+}
+
+// Session multiplexes streams over a pool of connections to one peer
+// (see package doc).
 type Session struct {
 	id        ID
-	conn      *crypto.Conn
 	initiator bool
+	dialer    Dialer
+	cfg       Config
 
-	writeMu sync.Mutex // serializes L2 Seal calls (nonce must advance in order)
+	connsMu     sync.Mutex
+	conns       map[uint64]*poolConn
+	nextConnID  uint64
+	pickCounter atomic.Uint64
+
+	budget *budgetController
+	rtt    *rttEstimator
+
+	seq atomic.Uint64
+
+	relMu      sync.Mutex
+	unacked    map[uint64]*pendingFrame
+	recvSeen   map[uint64]struct{}
+	cumulative uint64
 
 	mu           sync.Mutex
 	streams      map[uint32]*Stream
@@ -47,129 +72,103 @@ type Session struct {
 	closeOnce sync.Once
 	closed    chan struct{}
 	runErr    error
-
-	seq atomic.Uint64 // ТЗ §8.3: frame number is per-session, not per-stream
 }
 
-func New(id ID, conn *crypto.Conn, initiator bool) *Session {
-	return &Session{
+// New establishes the SESSION_ATTACH handshake on firstConn (which must
+// already be past L0-L2) and starts the pool/reliability machinery. As
+// initiator, id is this session's freshly generated ID; as responder, id
+// is ignored — the real ID is learned from the peer, and the returned
+// Session's ID() reflects that. dialer opens additional connections for
+// pool growth and migration (ТЗ §8.1, §8.4); pass nil to disable both
+// (the server side never dials the client).
+func New(id ID, firstConn *crypto.Conn, initiator bool, cfg Config, dialer Dialer) (*Session, error) {
+	if initiator {
+		if err := sendAttachRequest(firstConn, id); err != nil {
+			return nil, err
+		}
+		if err := readAttachReply(firstConn, id); err != nil {
+			return nil, err
+		}
+		return NewFromAttached(id, firstConn, true, cfg, dialer), nil
+	}
+
+	gotID, err := ReadAttach(firstConn)
+	if err != nil {
+		return nil, err
+	}
+	if err := CompleteAttach(firstConn, gotID); err != nil {
+		return nil, err
+	}
+	return NewFromAttached(gotID, firstConn, false, cfg, dialer), nil
+}
+
+// NewFromAttached constructs a session around a first connection that has
+// ALREADY completed the SESSION_ATTACH handshake on both sides (both
+// agree on id). This is what a server-side session registry uses: it
+// must read the attach ID itself (session.ReadAttach) to decide whether
+// this connection starts a new session or joins one already running,
+// before either path can construct/extend anything — see
+// transport.Server. New is a convenience wrapper around this for callers
+// (the client, and tests) that don't need to inspect the ID first.
+func NewFromAttached(id ID, firstConn *crypto.Conn, initiator bool, cfg Config, dialer Dialer) *Session {
+	s := &Session{
 		id:           id,
-		conn:         conn,
 		initiator:    initiator,
+		dialer:       dialer,
+		cfg:          cfg,
+		conns:        make(map[uint64]*poolConn),
+		nextConnID:   1,
+		budget:       newBudgetController(cfg.BudgetMin, cfg.BudgetMax, cfg.Adaptive),
+		rtt:          newRTTEstimator(cfg.AckTimeoutMin, cfg.AckTimeoutMax),
+		unacked:      make(map[uint64]*pendingFrame),
+		recvSeen:     make(map[uint64]struct{}),
 		streams:      make(map[uint32]*Stream),
+		nextStreamID: 1,
 		acceptCh:     make(chan *Stream, 16),
 		closed:       make(chan struct{}),
-		nextStreamID: 1,
 	}
+	s.AddConn(firstConn)
+	go s.maintainPool()
+	go s.retransmitLoop()
+	go s.ackLoop()
+	return s
 }
 
 func (s *Session) ID() ID { return s.id }
 
-// Attach performs the SESSION_ATTACH exchange: the initiator announces its
-// session ID; the responder echoes it back so both sides know the L3
-// channel is alive end to end. Phase 2 reuses this same frame to reattach
-// an existing session to a fresh connection after migration.
-func (s *Session) Attach() error {
-	if s.initiator {
-		if err := s.sendRaw(frame.TypeSessionAttach, 0, s.id[:]); err != nil {
-			return err
-		}
-		f, err := s.readOne()
-		if err != nil {
-			return err
-		}
-		if f.Type != frame.TypeSessionAttach || ID(f.Data[:16]) != s.id {
-			return fmt.Errorf("session: attach reply mismatch")
-		}
-		return nil
-	}
-
-	f, err := s.readOne()
-	if err != nil {
-		return err
-	}
-	if f.Type != frame.TypeSessionAttach || len(f.Data) < 16 {
-		return fmt.Errorf("session: expected SESSION_ATTACH, got %s", f.Type)
-	}
-	copy(s.id[:], f.Data[:16])
-	return s.sendRaw(frame.TypeSessionAttach, 0, s.id[:])
-}
-
-// Run reads frames until the connection fails and dispatches them. It
-// blocks; callers run it in its own goroutine and use AcceptStream /
-// Stream.Read/Write from others.
+// Run blocks until the session ends (every pool connection is gone with
+// no dialer able to replace them, or Close was called) and returns the
+// reason. All actual I/O happens in background goroutines started by New.
 func (s *Session) Run() error {
-	for {
-		f, err := s.readOne()
-		if err != nil {
-			s.shutdown(err)
-			return err
-		}
-		switch f.Type {
-		case frame.TypeData:
-			s.dispatchData(f)
-		case frame.TypeOpenStream:
-			s.handleOpenStream(f)
-		case frame.TypeCloseStream:
-			s.handleCloseStream(f)
-		case frame.TypeACK:
-			// Phase 1 generates ACKs for visibility but does not yet act on
-			// them (no retransmission without a connection pool to
-			// retransmit onto) — phase 2.
-		case frame.TypePing:
-			_ = s.sendRaw(frame.TypePing, f.StreamID, f.Data) // echo = pong
-		case frame.TypeRekey:
-			s.conn.RekeyRecv()
-		case frame.TypeSessionAttach:
-			// Duplicate post-handshake attach; ignore in phase 1.
-		case frame.TypePaddingOnly, frame.TypeWindowUpdate:
-			// Shaping (L5) and per-stream flow control are phase 3.
-		}
-	}
+	<-s.closed
+	return s.runErr
 }
 
-// No AEAD associated data is used for L3 records: the session ID itself is
-// the first thing exchanged (SESSION_ATTACH), so the responder doesn't know
-// it yet when decrypting that very first record, and each L1 connection
-// already gets a fresh Noise handshake (fresh keys) so binding records to
-// a session ID isn't needed for phase-1's single-connection model.
-func (s *Session) readOne() (*frame.Frame, error) {
-	pt, err := s.conn.Open(nil)
-	if err != nil {
-		return nil, err
-	}
-	return frame.Decode(pt)
-}
+// Done reports when the session has stopped.
+func (s *Session) Done() <-chan struct{} { return s.closed }
 
-// sendRaw encodes and seals one frame, driving L2 rekey at the boundary
-// (ТЗ §7) immediately beforehand so sender and receiver rotate in lockstep.
-func (s *Session) sendRaw(typ frame.Type, streamID uint32, data []byte) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	if typ != frame.TypeRekey && s.conn.ShouldRekeySend() {
-		buf, err := frame.Encode(nil, &frame.Frame{Type: frame.TypeRekey, StreamID: 0})
-		if err != nil {
-			return err
-		}
-		if err := s.conn.Seal(buf, nil); err != nil {
-			return err
-		}
-		s.conn.RekeySend()
-	}
-
-	seq := s.seq.Add(1)
-	buf, err := frame.Encode(nil, &frame.Frame{Type: typ, StreamID: streamID, Seq: seq, Data: data})
-	if err != nil {
-		return err
-	}
-	return s.conn.Seal(buf, nil)
+// Close ends the session locally without a clean L3 teardown message
+// (graceful multi-connection teardown framing is a phase-3 refinement).
+func (s *Session) Close() error {
+	s.shutdown(io.ErrClosedPipe)
+	return nil
 }
 
 func (s *Session) shutdown(err error) {
 	s.closeOnce.Do(func() {
 		s.runErr = err
 		close(s.closed)
+
+		s.connsMu.Lock()
+		conns := make([]*poolConn, 0, len(s.conns))
+		for _, pc := range s.conns {
+			conns = append(conns, pc)
+		}
+		s.connsMu.Unlock()
+		for _, pc := range conns {
+			_ = pc.conn.Close()
+		}
+
 		s.mu.Lock()
 		for _, st := range s.streams {
 			st.closeLocal(io.EOF)
@@ -178,12 +177,107 @@ func (s *Session) shutdown(err error) {
 	})
 }
 
-// Close ends the session locally without a clean L3 teardown message
-// (phase 1; graceful shutdown framing is phase 2).
-func (s *Session) Close() error {
-	s.shutdown(io.ErrClosedPipe)
+// readLoop pumps frames off one pool connection until it errors, then
+// evicts it (ТЗ §8.3/§8.4 treat a dead connection the same whether it died
+// outright or just stopped answering).
+func (s *Session) readLoop(pc *poolConn) {
+	for {
+		pt, err := pc.conn.Open(nil)
+		if err != nil {
+			s.evictConnection(pc)
+			return
+		}
+		f, err := frame.Decode(pt)
+		if err != nil {
+			s.evictConnection(pc)
+			return
+		}
+		s.accountRecv(pc, len(pt))
+		s.dispatch(f, pc)
+	}
+}
+
+func (s *Session) dispatch(f *frame.Frame, pc *poolConn) {
+	isNew := s.noteReceived(f.Seq)
+
+	switch f.Type {
+	case frame.TypeData:
+		if isNew {
+			s.dispatchData(f)
+		}
+	case frame.TypeACK:
+		if isNew {
+			s.handleAck(f)
+		}
+	case frame.TypeOpenStream:
+		if isNew {
+			s.handleOpenStream(f)
+		}
+	case frame.TypeCloseStream:
+		if isNew {
+			s.handleCloseStream(f)
+		}
+	case frame.TypePing:
+		_ = s.sendRaw(frame.TypePing, f.StreamID, f.Data) // echo = pong
+	case frame.TypeRekey:
+		pc.conn.RekeyRecv()
+	case frame.TypeSessionAttach:
+		// A stray/duplicate attach on an already-running connection; ignore.
+	case frame.TypePaddingOnly, frame.TypeWindowUpdate:
+		// Shaping (L5) and per-stream flow control are phase 3.
+	}
+}
+
+// sendOn seals buf onto one specific pool connection, driving that
+// connection's own L2 rekey at the boundary first (ТЗ §7 keys are per
+// connection, not per session) and accounting its send budget (ТЗ §8.2).
+func (s *Session) sendOn(pc *poolConn, buf []byte, dataLen int) error {
+	pc.writeMu.Lock()
+	defer pc.writeMu.Unlock()
+
+	if pc.conn.ShouldRekeySend() {
+		rbuf, err := frame.Encode(nil, &frame.Frame{Type: frame.TypeRekey})
+		if err == nil {
+			if err := pc.conn.Seal(rbuf, nil); err == nil {
+				pc.conn.RekeySend()
+			}
+		}
+	}
+
+	if err := pc.conn.Seal(buf, nil); err != nil {
+		s.evictConnection(pc)
+		return err
+	}
+	s.accountSend(pc, dataLen)
 	return nil
 }
 
-// Done reports when the session has stopped (connection failed or closed).
-func (s *Session) Done() <-chan struct{} { return s.closed }
+// sendRaw encodes and sends one frame. DATA frames are tracked for
+// retransmission (ТЗ §8.3); every other type is sent best-effort once.
+func (s *Session) sendRaw(typ frame.Type, streamID uint32, data []byte) error {
+	seq := s.seq.Add(1)
+	buf, err := frame.Encode(nil, &frame.Frame{Type: typ, StreamID: streamID, Seq: seq, Data: data})
+	if err != nil {
+		return err
+	}
+
+	if typ == frame.TypeData {
+		pf := &pendingFrame{seq: seq, streamID: streamID, data: append([]byte(nil), data...)}
+		s.relMu.Lock()
+		s.unacked[seq] = pf
+		s.relMu.Unlock()
+		// A total failure here is not an error to the caller (ТЗ §8.4: a
+		// pool hiccup must not break user streams) — the frame stays in
+		// `unacked` with a zero sentAt, which the retransmit loop treats
+		// as immediately overdue and retries as soon as any connection is
+		// available again.
+		s.trySend(pf, buf)
+		return nil
+	}
+
+	pc := s.pickConn(nil)
+	if pc == nil {
+		return fmt.Errorf("session: no live connection")
+	}
+	return s.sendOn(pc, buf, len(data))
+}

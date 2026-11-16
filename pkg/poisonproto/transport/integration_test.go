@@ -11,6 +11,7 @@ import (
 	"github.com/veritesclaude/svo-govno/pkg/poisonproto/auth"
 	"github.com/veritesclaude/svo-govno/pkg/poisonproto/fingerprint"
 	"github.com/veritesclaude/svo-govno/pkg/poisonproto/frame"
+	"github.com/veritesclaude/svo-govno/pkg/poisonproto/session"
 )
 
 const testBaseVariant = "00cc04d679090f04d679090e08839a648c9b2d011308839a648c9b2d010708839a648c9b2d010c04d679090308839a648c9b2d010d04d679090c04d679090a0582df13021404d67909040582df13020104d679090504d679090808839a648c9b2d01080582df13020d04d679090b08839a648c9b2d01090582df13020608839a648c9b2d010a0582df13021304d679090604d67909090582df1302120582df13020f04d679090d08839a648c9b2d010b04d67909010582df13020e04d679090208839a648c9b2d011204d6790907"
@@ -93,14 +94,15 @@ func TestDialAcceptEndToEnd(t *testing.T) {
 			resCh <- acceptResult{0, err}
 			return
 		}
-		sess, userID, err := Accept(conn, ServerConfig{
+		srv := &Server{Config: ServerConfig{
 			Verifier:    verifier,
 			NoiseStatic: serverPriv,
 			Cert:        cert,
 			FallbackDial: func(string) (net.Conn, error) {
 				return net.Dial("tcp", fallbackAddr)
 			},
-		})
+		}}
+		sess, userID, err := srv.HandleConn(conn)
 		if err != nil {
 			resCh <- acceptResult{0, err}
 			return
@@ -169,6 +171,108 @@ func TestDialAcceptEndToEnd(t *testing.T) {
 	}
 }
 
+func TestServerPoolsMultipleConnectionsIntoOneSession(t *testing.T) {
+	serverPriv, serverPub, err := auth.GenerateStaticKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := GenerateEphemeralCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier := auth.NewVerifier(serverPriv, 120*time.Second)
+	fallbackAddr, _ := startFakeFallback(t, []byte("unused"))
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	srv := &Server{Config: ServerConfig{
+		Verifier:    verifier,
+		NoiseStatic: serverPriv,
+		Cert:        cert,
+		FallbackDial: func(string) (net.Conn, error) {
+			return net.Dial("tcp", fallbackAddr)
+		},
+	}}
+
+	type accepted struct {
+		sess   *session.Session
+		userID uint64
+	}
+	acceptedCh := make(chan accepted, 8)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				sess, userID, err := srv.HandleConn(conn)
+				if err != nil {
+					t.Logf("HandleConn: %v", err)
+					return
+				}
+				acceptedCh <- accepted{sess, userID}
+			}()
+		}
+	}()
+
+	deviceSeed := make([]byte, 32)
+	rand.Read(deviceSeed)
+
+	clientSess, err := Dial(ClientConfig{
+		Addr:            ln.Addr().String(),
+		SNI:             "example.invalid",
+		ServerStaticPub: serverPub,
+		UserID:          7,
+		DeviceSeed:      deviceSeed,
+		Fingerprint:     testFingerprintParams(),
+		DialTimeout:     5 * time.Second,
+		Session: session.Config{
+			PoolMin: 3, PoolMax: 5,
+			BudgetMin: 1 << 30, BudgetMax: 1<<30 + 1,
+			Adaptive:      false,
+			AckTimeoutMin: 300 * time.Millisecond,
+			AckTimeoutMax: 500 * time.Millisecond,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer clientSess.Close()
+
+	var serverSess *session.Session
+	seen := map[session.ID]bool{}
+	deadline := time.After(5 * time.Second)
+	for len(seen) < 1 || serverSess == nil || serverSess.LiveConnCount() < 3 {
+		select {
+		case a := <-acceptedCh:
+			if a.userID != 7 {
+				t.Fatalf("userID: got %d want 7", a.userID)
+			}
+			seen[a.sess.ID()] = true
+			serverSess = a.sess
+			if len(seen) > 1 {
+				t.Fatalf("server created %d distinct sessions for one pool, want 1", len(seen))
+			}
+		case <-deadline:
+			t.Fatalf("timed out: server-side live conns=%d", func() int {
+				if serverSess == nil {
+					return -1
+				}
+				return serverSess.LiveConnCount()
+			}())
+		}
+	}
+
+	if serverSess.ID() != clientSess.ID() {
+		t.Fatalf("session ID mismatch: server %x client %x", serverSess.ID(), clientSess.ID())
+	}
+}
+
 func TestAcceptFallsBackOnInvalidToken(t *testing.T) {
 	serverPriv, _, err := auth.GenerateStaticKeyPair()
 	if err != nil {
@@ -194,14 +298,15 @@ func TestAcceptFallsBackOnInvalidToken(t *testing.T) {
 		if err != nil {
 			return
 		}
-		_, _, _ = Accept(conn, ServerConfig{
+		srv := &Server{Config: ServerConfig{
 			Verifier:    verifier,
 			NoiseStatic: serverPriv,
 			Cert:        cert,
 			FallbackDial: func(string) (net.Conn, error) {
 				return net.Dial("tcp", fallbackAddr)
 			},
-		})
+		}}
+		_, _, _ = srv.HandleConn(conn)
 	}()
 
 	// A well-formed yandex-android ClientHello, but with a random

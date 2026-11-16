@@ -27,6 +27,7 @@ import (
 	"github.com/veritesclaude/svo-govno/pkg/poisonproto/config"
 	"github.com/veritesclaude/svo-govno/pkg/poisonproto/fingerprint"
 	"github.com/veritesclaude/svo-govno/pkg/poisonproto/frame"
+	"github.com/veritesclaude/svo-govno/pkg/poisonproto/session"
 	"github.com/veritesclaude/svo-govno/pkg/poisonproto/transport"
 )
 
@@ -69,6 +70,28 @@ func main() {
 
 	userID := userIDFromToken(cfg.UserTokenID)
 
+	// One session carries a pool of connections (ТЗ §8.1) and multiplexes
+	// every accepted local connection as its own stream (ТЗ §9) — dialing
+	// a brand new session per local connection would spin up a whole
+	// fresh pool each time, which defeats the point of pooling.
+	sess, err := transport.Dial(transport.ClientConfig{
+		Addr:            net.JoinHostPort(srv.Addr, strconv.Itoa(srv.Port)),
+		SNI:             pickFallbackSNI(srv),
+		ServerStaticPub: serverPub,
+		UserID:          userID,
+		DeviceSeed:      deviceSeed,
+		Fingerprint:     fingerprintParamsFromConfig(cfg),
+		DialTimeout:     10 * time.Second,
+		Session:         sessionConfigFromConfig(cfg),
+	})
+	if err != nil {
+		log.Fatalf("dial poisonproto: %v", err)
+	}
+	go func() {
+		err := sess.Run()
+		log.Fatalf("session ended: %v", err)
+	}()
+
 	ln, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
 		log.Fatalf("listen: %v", err)
@@ -81,32 +104,12 @@ func main() {
 			log.Printf("accept: %v", err)
 			continue
 		}
-		go handleLocalConn(conn, *target, transport.ClientConfig{
-			Addr:            net.JoinHostPort(srv.Addr, strconv.Itoa(srv.Port)),
-			SNI:             pickFallbackSNI(srv),
-			ServerStaticPub: serverPub,
-			UserID:          userID,
-			DeviceSeed:      deviceSeed,
-			Fingerprint:     fingerprintParamsFromConfig(cfg),
-			DialTimeout:     10 * time.Second,
-		})
+		go handleLocalConn(conn, *target, sess)
 	}
 }
 
-func handleLocalConn(local net.Conn, target string, cfg transport.ClientConfig) {
+func handleLocalConn(local net.Conn, target string, sess *session.Session) {
 	defer local.Close()
-
-	sess, err := transport.Dial(cfg)
-	if err != nil {
-		log.Printf("dial poisonproto: %v", err)
-		return
-	}
-	go func() {
-		if err := sess.Run(); err != nil {
-			log.Printf("session ended: %v", err)
-		}
-	}()
-	defer sess.Close()
 
 	st, err := sess.OpenStream(frame.NetworkTCP, target)
 	if err != nil {
@@ -177,6 +180,21 @@ func userIDFromToken(token string) uint64 {
 	}
 	h := sha256.Sum256([]byte(token))
 	return binary.BigEndian.Uint64(h[:8])
+}
+
+func sessionConfigFromConfig(cfg *config.Config) session.Config {
+	sc := cfg.Session
+	toMs := func(ms [2]int) (time.Duration, time.Duration) {
+		return time.Duration(ms[0]) * time.Millisecond, time.Duration(ms[1]) * time.Millisecond
+	}
+	ackMin, ackMax := toMs(sc.AckTimeoutMs)
+	return session.Config{
+		PoolMin: sc.PoolSize[0], PoolMax: sc.PoolSize[1],
+		BudgetMin: sc.ConnBudgetBytes[0], BudgetMax: sc.ConnBudgetBytes[1],
+		Adaptive:      sc.Adaptive,
+		AckTimeoutMin: ackMin,
+		AckTimeoutMax: ackMax,
+	}
 }
 
 func fingerprintParamsFromConfig(cfg *config.Config) fingerprint.YandexAndroidParams {
